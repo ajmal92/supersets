@@ -1,0 +1,132 @@
+#!groovy
+@Library('jenkinsLib') _
+currentBuild.displayName = "#${env.BUILD_NUMBER}-${branch_name}"
+
+pipeline {
+    agent { node { label 'build-slave' } }
+    environment {
+        org = "ccctechcenter"
+        service = "superset"
+        namespace = "superset"
+        channel = "#sss-nextgen"
+        stack = "superglue"
+    }
+    parameters {
+        choice(
+            choices: '\nci\nqa\npilot\nprod',
+            description: 'override the target environment for deployment',
+            name: 'env_override')
+        choice(
+            choices: 'deploy_service\ndeploy_dashboard\nnone',
+            description: 'override the deployment mode',
+            name: 'deploy_mode')
+        string(
+            defaultValue: '',
+            description: 'override the the image tag used for this release. If set, no build will occur and the image will just be pulled from the registry',
+            name: 'tag_override'
+        )
+        booleanParam(
+            name: 'run_tests',
+            defaultValue: true,
+            description: 'Run the cypress tests'
+        )
+    }
+    options {
+        buildDiscarder(logRotator(artifactDaysToKeepStr: '60', artifactNumToKeepStr: '10', daysToKeepStr: '60', numToKeepStr: '10'))
+        timestamps()
+    }
+    stages {
+        stage('init') {
+            steps {
+                script {
+                    env.environment = !params.env_override ? ceEnv.getEnvironmentFromBranchName(env.BRANCH_NAME, env.service) : params.env_override
+                    env.url = env.environment != "prod" ? "https://${env.service}.${env.environment}.ccctechcenter.org" : "https://${env.service}.ccctechcenter.org"
+                    env.run_tests = !params.run_tests ? false : params.run_tests
+                    env.deploy_mode = params.deploy_mode
+                    ceEnv.setSSMCreds("${environment}")
+                    KEYCLOAK_CLIENT_SECRET = ceEnv.getSSMParameter("/${env.environment}/keycloak/superset-client/secret")
+                    env.CYPRESS_BASE_URL = env.environment != "prod" ? "https://analytics.${env.environment}.ccctechcenter.org" : "https://analytics.ccctechcenter.org"
+                    env.CYPRESS_SUPERSET_LOGIN = "autotester@ccctechcenter.org"
+                    env.CYPRESS_SUPERSET_PASSWORD = ceEnv.getSSMParameter("/${env.environment}/keycloak/openCCC-realm/superset/admin_user_password")
+                    env.api_login = "apiuser"
+                    env.api_password = ceEnv.getSSMParameter("/${env.environment}/superset/apiuser/password")
+                    ceEnv.unsetSSMCreds()     
+                    env.tag = "N/A" //image tag for apache/superset is defined in values.yaml
+                    echo "user is $api_login "
+                }
+            }
+        }
+      stage('build') {
+            steps {
+                nodejs('Node14.16.1') {
+                    sh label: "Add npm packages", script: "npm i"
+                }
+            }
+        }
+        stage('Deploy') {
+            when {
+            expression { env.deploy_mode =="deploy_service" }
+            }
+            steps {
+                script {
+                    if ((env.environment == "pilot" || env.environment == "prod") && !ceEnv.isAuthorized("admin-deploy")) {
+                        ceEnv.requestAuth(env.service, env.environment, env.channel, "admin-deploy")
+                    }
+                    env.helm_args = "--set-file configOverrides.oauth=deployment/superset/app/pythonpath/keycloak_security_manager.py --set keycloakClientSecret=${KEYCLOAK_CLIENT_SECRET}"
+                    if (env.deploy_mode == "false") {
+                        env.helm_args = "${env.helm_args} --dry-run"
+                    }
+                    kubeDeploy name: env.service,
+                        args: "${env.helm_args}",
+                        chart: "./deployment/${env.service}",
+                        environment: env.environment,
+                        namespace: env.namespace,
+                        cluster: "${env.stack}-${env.environment}",
+                        values_files: "values-${env.environment}.yaml",
+                        timeout: "240s"
+                }
+            }
+        }
+        stage('Deploy superset dashboard'){
+            when {
+            expression{ env.deploy_mode == "deploy_dashboard" }
+            }
+            steps {
+            sh "python supersets.py --base_url ${env.CYPRESS_BASE_URL} --login ${env.api_login} --password ${env.api_password}"
+            }
+        }
+        stage('post-deploy testing') {
+            when { expression { env.deploy_mode =="deploy_service" } }
+            steps {
+                nodejs('Node14.16.1') {
+                    sh label: 'all tests', returnStatus: true, script: "yarn cy:run"
+                }
+                junit allowEmptyResults: true, testResults: 'results/*.xml'
+                archiveArtifacts allowEmptyArchive: true, artifacts: '**/*.mp3', followSymlinks: false
+            }
+        }
+    }
+    post {
+        success {
+            script {
+                ceDeploy.slackNotify(channel, "good", "Success", env.service, environment, env.url, env.tag)
+            }
+        }
+        failure {
+            script {
+                kubeDeploy rollback: true, environment: env.environment, name: env.service, namespace: env.namespace, cluster: "${env.stack}-${env.environment}"
+                ceDeploy.slackNotify(channel, "danger", "Failure", env.service, environment, env.url, env.tag)
+            }
+        }
+        unstable {
+            script {
+                ceDeploy.slackNotify(channel, "warning", "had test failures", env.service, environment, env.url, env.tag)
+            }
+        }
+        aborted {
+            script {
+                kubeDeploy rollback: true, environment: env.environment, name: env.service, namespace: env.namespace, cluster: "${env.stack}-${env.environment}"
+            }
+        }
+    }
+}
