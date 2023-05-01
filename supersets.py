@@ -5,8 +5,6 @@ import subprocess
 import tempfile
 
 
-
-
 def options():
     parser = argparse.ArgumentParser(description='Streamsets CI/CD script')
     parser.add_argument('-base_url', default='base_url', required=True)
